@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Transferência P2P de Grandes Arquivos (10 GB)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 650px; margin: 20px auto; padding: 0 10px; }
+    textarea { width: 100%; height: 70px; }
+    progress { width: 100%; height: 25px; margin: 10px 0; }
+    .box { border: 1px solid #ccc; padding: 15px; border-radius: 6px; margin-bottom: 15px; }
+  </style>
+</head>
+<body>
+
+  <h2>Transferência P2P streaming de Grandes Arquivos (WebRTC)</h2>
+
+  <!-- PASSO 1: SINALIZAÇÃO -->
+  <div class="box">
+    <h3>1. Sinalização da Conexão</h3>
+    <button id="btnInit">1. Gerar Oferta (Emissor / Peer A)</button>
+    <br><br>
+    <textarea id="localSdp" readonly placeholder="Sua chave de conexão aparecerá aqui..."></textarea>
+    <br><br>
+    <textarea id="remoteSdp" placeholder="Cole a chave do outro Peer aqui..."></textarea>
+    <button id="btnConnect">2. Conectar Peers</button>
+  </div>
+
+  <!-- PASSO 2: ENVIO (EMISSOR) -->
+  <div class="box">
+    <h3>2. Emissor (Enviar Arquivo)</h3>
+    <input type="file" id="fileInput">
+    <br><br>
+    <button id="btnSendFile" disabled>Enviar Arquivo de Grande Porte</button>
+  </div>
+
+  <!-- PASSO 3: RECEBIMENTO (RECEPTOR) -->
+  <div class="box">
+    <h3>3. Progresso e Download</h3>
+    <p id="status">Aguardando conexão...</p>
+    <progress id="progressBar" value="0" max="100"></progress>
+    <a id="downloadBtn" style="display:none;" download>Clique aqui para Salvar o Arquivo Baixado</a>
+  </div>
+
+  <script>
+    const CHUNK_SIZE = 64 * 1024; // 64 KB por pedaço
+    const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // Pausa o envio se o buffer atingir 8 MB
+
+    const peer = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    let dataChannel;
+    let fileMeta = null;
+    let receivedSize = 0;
+    let writableStream = null;
+    let fileHandle = null;
+
+    const btnInit = document.getElementById('btnInit');
+    const btnConnect = document.getElementById('btnConnect');
+    const btnSendFile = document.getElementById('btnSendFile');
+    const fileInput = document.getElementById('fileInput');
+    const localSdp = document.getElementById('localSdp');
+    const remoteSdp = document.getElementById('remoteSdp');
+    const statusText = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    // ----------------------------------------------------
+    // SINALIZAÇÃO E CONEXÃO
+    // ----------------------------------------------------
+    peer.onicecandidate = (e) => {
+      if (!e.candidate) {
+        localSdp.value = JSON.stringify(peer.localDescription);
+      }
+    };
+
+    btnInit.onclick = async () => {
+      // Garante entrega confiável e ordenada dos chunks para não corromper o arquivo
+      dataChannel = peer.createDataChannel("fileTransfer", { ordered: true });
+      setupSenderChannel();
+
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+    };
+
+    btnConnect.onclick = async () => {
+      const remoteData = JSON.parse(remoteSdp.value);
+      if (remoteData.type === 'offer') {
+        await peer.setRemoteDescription(remoteData);
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+      } else if (remoteData.type === 'answer') {
+        await peer.setRemoteDescription(remoteData);
+      }
+    };
+
+    peer.ondatachannel = (e) => {
+      dataChannel = e.channel;
+      setupReceiverChannel();
+    };
+
+    // ----------------------------------------------------
+    // LÓGICA DO EMISSOR (STREAMING DE LEITURA + BACKPRESSURE)
+    // ----------------------------------------------------
+    function setupSenderChannel() {
+      dataChannel.binaryType = 'arraybuffer';
+      dataChannel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
+
+      dataChannel.onopen = () => {
+        statusText.innerText = "Conectado P2P! Escolha um arquivo para enviar.";
+        btnSendFile.disabled = false;
+      };
+    }
+
+    btnSendFile.onclick = async () => {
+      const file = fileInput.files[0];
+      if (!file) return alert("Selecione um arquivo primeiro!");
+
+      // 1. Envia um cabeçalho JSON indicando o nome e tamanho do arquivo
+      dataChannel.send(JSON.stringify({
+        type: 'meta',
+        name: file.name,
+        size: file.size
+      }));
+
+      let offset = 0;
+      statusText.innerText = `Enviando ${file.name}...`;
+
+      // Função recursiva para ler e enviar em blocos mantendo a RAM baixa
+      const sendNextChunk = () => {
+        while (offset < file.size) {
+          // Controle de fluxo (Backpressure): Se a rede estiver sobrecarregada, aguarda esvaziar
+          if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+            dataChannel.onbufferedamountlow = () => {
+              dataChannel.onbufferedamountlow = null;
+              sendNextChunk();
+            };
+            return;
+          }
+
+          const slice = file.slice(offset, offset + CHUNK_SIZE);
+          const reader = new FileReader();
+
+          reader.onload = (e) => {
+            if (dataChannel.readyState !== 'open') return;
+            dataChannel.send(e.target.result);
+            offset += e.target.result.byteLength;
+            
+            // Atualiza progresso do envio
+            progressBar.value = Math.round((offset / file.size) * 100);
+
+            if (offset < file.size) {
+              sendNextChunk();
+            } else {
+              statusText.innerText = "Envio concluído com sucesso!";
+            }
+          };
+
+          reader.readAsArrayBuffer(slice);
+          return; // Espera a leitura assíncrona do chunk
+        }
+      };
+
+      sendNextChunk();
+    };
+
+    // ----------------------------------------------------
+    // LÓGICA DO RECEPTOR (SALVAMENTO DIRETO VIA OPFS)
+    // ----------------------------------------------------
+    function setupReceiverChannel() {
+      dataChannel.binaryType = 'arraybuffer';
+
+      dataChannel.onopen = () => {
+        statusText.innerText = "Conectado P2P! Aguardando o outro peer enviar o arquivo...";
+      };
+
+      dataChannel.onmessage = async (e) => {
+        // Trata os dados recebidos
+        if (typeof e.data === 'string') {
+          // Recebeu os metadados do arquivo
+          fileMeta = JSON.parse(e.data);
+          receivedSize = 0;
+          statusText.innerText = `Recebendo: ${fileMeta.name} (${(fileMeta.size / 1024 / 1024 / 1024).toFixed(2)} GB)...`;
+
+          // Abre o diretório privado do navegador (OPFS) para escrita em disco
+          const opfsRoot = await navigator.storage.getDirectory();
+          fileHandle = await opfsRoot.getFileHandle(fileMeta.name, { create: true });
+          writableStream = await fileHandle.createWritable();
+
+        } else if (e.data instanceof ArrayBuffer) {
+          // Recebeu um chunk binário do arquivo -> grava diretamente no disco
+          await writableStream.write(e.data);
+          receivedSize += e.data.byteLength;
+
+          progressBar.value = Math.round((receivedSize / fileMeta.size) * 100);
+
+          // Quando a transferência for finalizada
+          if (receivedSize >= fileMeta.size) {
+            await writableStream.close(); // Fecha o arquivo no disco
+            statusText.innerText = "Download concluído e salvo localmente!";
+
+            // Cria o link para mover o arquivo da OPFS para a pasta Downloads do usuário
+            const downloadedFile = await fileHandle.getFile();
+            downloadBtn.href = URL.createObjectURL(downloadedFile);
+            downloadBtn.download = fileMeta.name;
+            downloadBtn.style.display = 'inline-block';
+            downloadBtn.innerText = `Salvar "${fileMeta.name}" na sua pasta de Downloads`;
+          }
+        }
+      };
+    }
+  </script>
+</body>
+</html>
